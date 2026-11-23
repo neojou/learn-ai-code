@@ -1,36 +1,77 @@
-
-
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
+
+fn empty_if_null<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn empty_tool_calls<'de, D>(deserializer: D) -> Result<Option<Vec<ToolCall>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let calls = Option::<Vec<ToolCall>>::deserialize(deserializer)?;
+    Ok(calls.filter(|calls| !calls.is_empty()))
+}
+
+fn skip_empty_tool_calls(calls: &Option<Vec<ToolCall>>) -> bool {
+    calls.as_ref().map(|calls| calls.is_empty()).unwrap_or(true)
+}
+
+/// Ollama usually returns `arguments` as an object. Some responses send a JSON string.
+fn arguments_as_value<'de, D>(deserializer: D) -> Result<Value, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(parsed) => Ok(parsed),
+            Err(_) => Ok(Value::String(text)),
+        },
+        other => Ok(other),
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Message {
     pub role: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "empty_if_null")]
     pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "empty_tool_calls",
+        skip_serializing_if = "skip_empty_tool_calls"
+    )]
     pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<String>,
     pub function: ToolFunction,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ToolFunction {
     pub name: String,
-    pub arguments: Value, // Ollama 會直接解析好 JSON 物件回傳
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    #[serde(default, deserialize_with = "arguments_as_value")]
+    pub arguments: Value,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug)]
 pub struct OllamaResponse {
-    #[serde(default)]
-    pub model: String,
     pub message: Message,
-    #[serde(default)]
-    pub done: bool,
 }
 
 #[derive(Default, Clone)]
@@ -66,7 +107,7 @@ impl<'a> MessageBuilder<'a> {
     pub async fn send(self) -> Result<OllamaResponse, Box<dyn std::error::Error>> {
         let url = format!("{}/api/chat", self.client.base_url);
 
-        // 1. 插入 System Prompt
+        // Ollama has no top-level system field. Keep it out of the caller's history.
         let mut final_messages = self.request.messages.clone();
         if let Some(sys) = &self.request.system {
             final_messages.insert(
@@ -74,12 +115,11 @@ impl<'a> MessageBuilder<'a> {
                 Message {
                     role: "system".to_string(),
                     content: sys.clone(),
-                    tool_calls: None,
+                    ..Default::default()
                 },
             );
         }
 
-        // 2. 組裝符合 Ollama API 規格的 JSON
         let mut payload = json!({
             "model": self.request.model,
             "messages": final_messages,
@@ -90,23 +130,25 @@ impl<'a> MessageBuilder<'a> {
             payload["tools"] = json!(tools);
         }
 
+        // Do not send `think: false`. With a system prompt, gemma4 then leaks
+        // tool calls into `content` instead of `tool_calls`.
         if let Some(max_tokens) = self.request.max_tokens {
             payload["options"] = json!({
                 "num_predict": max_tokens
             });
         }
 
-        // 3. 發送請求與解析
         let res = self.client.http.post(&url).json(&payload).send().await?;
         let status = res.status();
         let body_text = res.text().await?;
 
         if !status.is_success() {
-            return Err(format!("Ollama API 錯誤 ({}): {}", status, body_text).into());
+            return Err(format!("Ollama API error ({status}): {body_text}").into());
         }
 
-        let parsed: OllamaResponse = serde_json::from_str(&body_text)
-            .map_err(|e| format!("JSON 解析失敗: {} | 原始回傳: {}", e, body_text))?;
+        let parsed: OllamaResponse = serde_json::from_str(&body_text).map_err(|err| {
+            format!("JSON parse error: {err} | body: {body_text}")
+        })?;
 
         Ok(parsed)
     }
@@ -146,5 +188,97 @@ impl Ollama {
 
     pub fn messages(&self) -> Messages<'_> {
         Messages { client: self }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_response(raw: &str) -> OllamaResponse {
+        serde_json::from_str(raw).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    #[test]
+    fn parses_null_content_and_keeps_tool_call_fields() {
+        let parsed = parse_response(
+            r#"{
+                "model": "gemma4",
+                "done": true,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "thinking": "ignore me",
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {
+                            "index": 0,
+                            "name": "bash",
+                            "arguments": {"command": "ls"}
+                        }
+                    }]
+                }
+            }"#,
+        );
+        assert_eq!(parsed.message.content, "");
+        let call = &parsed.message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.id.as_deref(), Some("call_abc"));
+        assert_eq!(call.call_type.as_deref(), Some("function"));
+        assert_eq!(call.function.index, Some(0));
+        assert_eq!(call.function.arguments["command"], "ls");
+
+        let replay = serde_json::to_value(&parsed.message).unwrap();
+        assert!(replay.get("thinking").is_none());
+        assert_eq!(replay["tool_calls"][0]["id"], "call_abc");
+        assert_eq!(replay["tool_calls"][0]["type"], "function");
+        assert_eq!(replay["tool_calls"][0]["function"]["index"], 0);
+        assert_eq!(replay["tool_calls"][0]["function"]["arguments"]["command"], "ls");
+
+        let tool = Message {
+            role: "tool".to_string(),
+            content: "file.rs".to_string(),
+            tool_name: Some("bash".to_string()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&tool).unwrap();
+        assert_eq!(value["role"], "tool");
+        assert_eq!(value["tool_name"], "bash");
+        assert_eq!(value["content"], "file.rs");
+        assert!(value.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn parses_arguments_given_as_json_string() {
+        let parsed = parse_response(
+            r#"{
+                "model": "gemma4",
+                "done": true,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "function": {
+                            "name": "bash",
+                            "arguments": "{\"command\":\"date\"}"
+                        }
+                    }]
+                }
+            }"#,
+        );
+        let args = &parsed.message.tool_calls.unwrap()[0].function.arguments;
+        assert_eq!(args["command"], "date");
+    }
+
+    #[test]
+    fn omits_empty_tool_calls() {
+        let message = Message {
+            role: "assistant".to_string(),
+            content: "done".to_string(),
+            tool_calls: Some(vec![]),
+            tool_name: None,
+        };
+        let value = serde_json::to_value(&message).unwrap();
+        assert!(value.get("tool_calls").is_none());
+        assert!(value.get("tool_name").is_none());
     }
 }
