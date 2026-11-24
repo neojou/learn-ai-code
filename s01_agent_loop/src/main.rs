@@ -1,53 +1,11 @@
-//! s01_agent_loop — the agent loop.
-//!
-//!     while True:
-//!         response = LLM(messages, tools)
-//!         if response contains no tool_use:
-//!             break
-//!         execute tools
-//!         append results
-
 mod ollama;
 
 use ollama::{Message, Ollama};
-use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
 use serde_json::{json, Value};
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-
-fn tools() -> Vec<Value> {
-    vec![json!({
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": "Run a shell command.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" }
-                },
-                "required": ["command"]
-            }
-        }
-    })]
-}
-
-fn system_prompt() -> String {
-    let cwd = std::env::current_dir()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| ".".to_string());
-    let environment = if cfg!(windows) {
-        "Windows: the bash tool runs through cmd.exe; use cmd.exe syntax, not Unix Bash or PowerShell syntax"
-    } else {
-        "Unix-like: the bash tool runs the system shell"
-    };
-    format!(
-        "You are a coding agent at {cwd}. Environment: {environment}. Use bash to solve tasks. Act, don't explain."
-    )
-}
 
 fn run_bash(command: &str) -> String {
     const DANGEROUS: [&str; 5] = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
@@ -118,9 +76,40 @@ fn read_pipe(pipe: Option<impl Read>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+fn system_prompt() -> String {
+    let cwd = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let environment = if cfg!(windows) {
+        "Windows: the bash tool runs through cmd.exe; use cmd.exe syntax, not Unix Bash or PowerShell syntax"
+    } else {
+        "Unix-like: the bash tool runs the system shell"
+    };
+    format!(
+        "You are a coding agent at {cwd}. Environment: {environment}. Use bash to solve tasks. Act, don't explain."
+    )
+}
+
+fn tools() -> Vec<Value> {
+    vec![json!({
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                },
+                "required": ["command"]
+            }
+        }
+    })]
+}
+
 async fn agent_loop(
     client: &Ollama,
-    messages: &mut Vec<Message>,
+    messages: &mut Vec<Message>
 ) -> Result<(), Box<dyn std::error::Error>> {
     let system = system_prompt();
     let tools = tools();
@@ -151,16 +140,16 @@ async fn agent_loop(
                     .arguments
                     .get("command")
                     .and_then(Value::as_str)
-                {
-                    Some(command) => {
-                        println!("\x1b[33m$ {command}\x1b[0m");
-                        let output = run_bash(command);
-                        let preview: String = output.chars().take(200).collect();
-                        println!("{preview}");
-                        output
+                    {
+                        Some(command) => {
+                            println!("\x1b[33m$ {command}\x1b[0m");
+                            let output = run_bash(command);
+                            let preview: String = output.chars().take(200).collect();
+                            println!("{preview}");
+                            output
+                        }
+                        None => "Error: missing command".to_string(),
                     }
-                    None => "Error: missing command".to_string(),
-                }
             } else {
                 format!("Error: unknown tool {name}")
             };
@@ -175,6 +164,7 @@ async fn agent_loop(
     }
 }
 
+
 fn print_final_text(messages: &[Message]) {
     if let Some(last) = messages.last() {
         if last.role == "assistant" && !last.content.is_empty() {
@@ -185,29 +175,29 @@ fn print_final_text(messages: &[Message]) {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("s01: Agent Loop");
-    println!("Enter a question, press Enter to send. Type q to quit.\n");
-
+async fn main() {
     let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
     let model = std::env::var("MODEL_ID").unwrap_or_else(|_| "gemma4".to_string());
     let client = Ollama::new(host, model);
 
-    let mut rl = DefaultEditor::new()?;
-    let mut history = Vec::new();
+    println!("s01: Agent Loop");
+    println!("Enter a question, press Enter to send. Type q to quit.");
 
+    let mut history = Vec::new();
     loop {
-        let readline = rl.readline("\x1b[36ms01 >> \x1b[0m");
-        match readline {
-            Ok(line) => {
-                let query = line.trim();
+        print!("s01 >> ");
+        io::stdout().flush().expect("Can't flush stdout");
+
+        let mut input = String::new();
+        match std::io::stdin().read_line(&mut input) {
+            Ok(_) => {
+                let query = input.trim();
                 if query.is_empty() {
                     continue;
                 }
                 if matches!(query.to_lowercase().as_str(), "q" | "exit") {
                     break;
                 }
-                let _ = rl.add_history_entry(query);
 
                 history.push(Message {
                     role: "user".to_string(),
@@ -220,15 +210,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!();
                     continue;
                 }
+
                 print_final_text(&history);
+
             }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                eprintln!("Input error: {err}");
+                break;
+            }
         }
     }
-
-    Ok(())
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -247,3 +240,4 @@ mod tests {
         assert_eq!(run_bash("true"), "(no output)");
     }
 }
+
