@@ -138,6 +138,8 @@ impl<'a> MessageBuilder<'a> {
             });
         }
 
+        println!(">>> 發送給 Ollama:\n{}", serde_json::to_string_pretty(&payload).unwrap());
+
         let res = self.client.http.post(&url).json(&payload).send().await?;
         let status = res.status();
         let body_text = res.text().await?;
@@ -145,6 +147,8 @@ impl<'a> MessageBuilder<'a> {
         if !status.is_success() {
             return Err(format!("Ollama API error ({status}): {body_text}").into());
         }
+
+        println!("<<< Ollama 回傳:\n{}", body_text);
 
         let parsed: OllamaResponse = serde_json::from_str(&body_text).map_err(|err| {
             format!("JSON parse error: {err} | body: {body_text}")
